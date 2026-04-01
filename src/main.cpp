@@ -101,7 +101,22 @@ void handle_client(int client_fd) {
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
             }
-            // --- NEW LLEN LOGIC ---
+            // --- NEW LPOP LOGIC ---
+            else if (command == "lpop" && parts.size() >= 2) {
+                std::string res = "$-1\r\n";
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    if (kv_store.count(parts[1]) && kv_store[parts[1]].type == T_LIST) {
+                        std::vector<std::string> &list = kv_store[parts[1]].list_val;
+                        if (!list.empty()) {
+                            std::string val = list[0];
+                            list.erase(list.begin());
+                            res = to_bulk_string(val);
+                        }
+                    }
+                }
+                send(client_fd, res.c_str(), res.length(), 0);
+            }
             else if (command == "llen" && parts.size() >= 2) {
                 int length = 0;
                 {
