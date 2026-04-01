@@ -34,19 +34,16 @@ std::unordered_map<std::string, Node> kv_store;
 std::mutex kv_mutex;
 std::condition_variable cv;
 
-// Helper to parse "ms-seq" into two long longs
 bool parse_id(const std::string& id_str, long long& ms, long long& seq) {
     size_t dash_pos = id_str.find('-');
     if (dash_pos == std::string::npos) return false;
     try {
         ms = std::stoll(id_str.substr(0, dash_pos));
         std::string seq_part = id_str.substr(dash_pos + 1);
-        if (seq_part == "*") return false; // Handle * separately in logic
+        if (seq_part == "*") return false;
         seq = std::stoll(seq_part);
         return true;
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
 }
 
 std::string to_lowercase(std::string s) {
@@ -87,51 +84,46 @@ void handle_client(int client_fd) {
                 std::string command = to_lowercase(parts[0]);
                 std::string response = "";
 
-                if (command == "xadd" && parts.size() >= 4) {
+                if (command == "blpop" && parts.size() >= 3) {
                     std::string key = parts[1];
-                    std::string id_input = parts[2];
-                    std::string final_id = "";
-                    
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    Node &n = kv_store[key];
-                    n.type = T_STREAM;
+                    double timeout = std::stod(parts[2]);
+                    std::unique_lock<std::mutex> lock(kv_mutex);
+                    auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
 
-                    long long last_ms = -1, last_seq = -1;
-                    if (!n.stream_val.empty()) {
-                        parse_id(n.stream_val.back().id, last_ms, last_seq);
+                    bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) 
+                                               : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
+                    if (ready) {
+                        std::string val = kv_store[key].list_val.front();
+                        kv_store[key].list_val.pop_front();
+                        response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                    } else {
+                        response = "*-1\r\n";
                     }
+                    lock.unlock();
+                    send(client_fd, response.c_str(), response.length(), 0);
+                    response = ""; // Important: don't let the loop send again
+                }
+                else if (command == "xadd" && parts.size() >= 4) {
+                    std::string key = parts[1], id_input = parts[2], final_id = "";
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    Node &n = kv_store[key]; n.type = T_STREAM;
+                    long long last_ms = -1, last_seq = -1;
+                    if (!n.stream_val.empty()) parse_id(n.stream_val.back().id, last_ms, last_seq);
 
-                    // Handle sequence auto-generation: "ms-*"
                     if (id_input.find("-*") != std::string::npos) {
                         long long ms = std::stoll(id_input.substr(0, id_input.find('-')));
-                        long long seq;
-
-                        if (ms == 0) {
-                            // If ms is 0, sequence starts at 1, or increments
-                            seq = (last_ms == 0) ? last_seq + 1 : 1;
-                        } else {
-                            if (ms == last_ms) seq = last_seq + 1;
-                            else seq = 0;
-                        }
+                        long long seq = (ms == 0) ? ((last_ms == 0) ? last_seq + 1 : 1) : ((ms == last_ms) ? last_seq + 1 : 0);
                         final_id = std::to_string(ms) + "-" + std::to_string(seq);
-                    } else {
-                        final_id = id_input;
-                    }
+                    } else { final_id = id_input; }
 
-                    // Validation Logic
                     long long n_ms, n_seq;
-                    if (!parse_id(final_id, n_ms, n_seq)) {
-                         response = "-ERR Invalid ID format\r\n";
-                    } else if (n_ms == 0 && n_seq == 0) {
-                        response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
-                    } else if (last_ms != -1 && (n_ms < last_ms || (n_ms == last_ms && n_seq <= last_seq))) {
+                    if (final_id == "0-0") response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+                    else if (!parse_id(final_id, n_ms, n_seq)) response = "-ERR Invalid ID format\r\n";
+                    else if (last_ms != -1 && (n_ms < last_ms || (n_ms == last_ms && n_seq <= last_seq))) 
                         response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
-                    } else {
-                        StreamEntry entry;
-                        entry.id = final_id;
-                        for (size_t i = 3; i + 1 < parts.size(); i += 2) {
-                            entry.fields[parts[i]] = parts[i+1];
-                        }
+                    else {
+                        StreamEntry entry; entry.id = final_id;
+                        for (size_t i = 3; i + 1 < parts.size(); i += 2) entry.fields[parts[i]] = parts[i+1];
                         n.stream_val.push_back(entry);
                         response = to_bulk_string(final_id);
                     }
