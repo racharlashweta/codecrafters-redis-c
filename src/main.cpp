@@ -55,27 +55,23 @@ void handle_client(int client_fd) {
 
             if (parts.empty()) continue;
             std::string command = to_lowercase(parts[0]);
+            std::string response;
 
             // --- TYPE ---
             if (command == "type" && parts.size() >= 2) {
-                std::string res = "+none\r\n";
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (kv_store.count(parts[1])) {
+                    if (!kv_store.count(parts[1])) {
+                        response = "+none\r\n";
+                    } else {
                         Node &n = kv_store[parts[1]];
-                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) {
-                            kv_store.erase(parts[1]);
-                        } else {
-                            if (n.type == T_STRING) res = "+string\r\n";
-                            else if (n.type == T_LIST) res = "+list\r\n";
-                        }
+                        if (n.type == T_STRING) response = "+string\r\n";
+                        else if (n.type == T_LIST) response = "+list\r\n";
                     }
                 }
-                send(client_fd, res.c_str(), res.length(), 0);
             }
-            // --- PUSH (RPUSH/LPUSH) ---
-            else if (command == "rpush" || command == "lpush") {
-                int new_len = 0;
+            // --- RPUSH / LPUSH ---
+            else if ((command == "rpush" || command == "lpush") && parts.size() >= 3) {
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     Node &n = kv_store[parts[1]];
@@ -84,107 +80,95 @@ void handle_client(int client_fd) {
                         if (command == "rpush") n.list_val.push_back(parts[i]);
                         else n.list_val.insert(n.list_val.begin(), parts[i]);
                     }
-                    new_len = n.list_val.size();
+                    response = ":" + std::to_string(n.list_val.size()) + "\r\n";
                 }
                 cv.notify_all(); 
-                std::string res = ":" + std::to_string(new_len) + "\r\n";
-                send(client_fd, res.c_str(), res.length(), 0);
             }
-            // --- BLPOP (Blocking Pop) ---
+            // --- BLPOP ---
             else if (command == "blpop" && parts.size() >= 3) {
                 std::string key = parts[1];
-                double timeout_secs = 0;
-                try { timeout_secs = std::stod(parts[2]); } catch (...) { timeout_secs = 0; }
-                
-                std::string res;
+                double timeout = std::stod(parts[2]);
                 std::unique_lock<std::mutex> lock(kv_mutex);
-                auto predicate = [&key] {
-                    return kv_store.count(key) && !kv_store[key].list_val.empty();
-                };
+                auto pred = [&key] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
 
-                bool success = true;
-                if (timeout_secs == 0) {
-                    cv.wait(lock, predicate);
-                } else {
-                    success = cv.wait_for(lock, std::chrono::duration<double>(timeout_secs), predicate);
-                }
+                bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) 
+                                           : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
 
-                if (success && kv_store.count(key) && !kv_store[key].list_val.empty()) {
-                    std::vector<std::string> &list = kv_store[key].list_val;
-                    std::string val = list[0];
-                    list.erase(list.begin());
-                    res = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                if (ready) {
+                    std::string val = kv_store[key].list_val[0];
+                    kv_store[key].list_val.erase(kv_store[key].list_val.begin());
+                    response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
                 } else {
-                    res = "*-1\r\n"; 
+                    response = "*-1\r\n";
                 }
-                lock.unlock();
-                send(client_fd, res.c_str(), res.length(), 0);
+                lock.unlock(); // Explicitly unlock before send
             }
-            // --- LPOP (Non-blocking) ---
+            // --- LPOP ---
             else if (command == "lpop" && parts.size() >= 2) {
-                std::string res;
-                {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (!kv_store.count(parts[1]) || kv_store[parts[1]].type != T_LIST || kv_store[parts[1]].list_val.empty()) {
-                        res = "$-1\r\n";
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                if (!kv_store.count(parts[1]) || kv_store[parts[1]].list_val.empty()) {
+                    response = "$-1\r\n";
+                } else {
+                    auto &list = kv_store[parts[1]].list_val;
+                    if (parts.size() == 2) {
+                        std::string val = list[0]; list.erase(list.begin());
+                        response = to_bulk_string(val);
                     } else {
-                        std::vector<std::string> &list = kv_store[parts[1]].list_val;
-                        if (parts.size() == 2) {
-                            std::string val = list[0];
+                        int count = std::stoi(parts[2]);
+                        int to_pop = std::min(count, (int)list.size());
+                        response = "*" + std::to_string(to_pop) + "\r\n";
+                        for (int i = 0; i < to_pop; ++i) {
+                            response += to_bulk_string(list[0]);
                             list.erase(list.begin());
-                            res = to_bulk_string(val);
-                        } else {
-                            int count = std::stoi(parts[2]);
-                            int to_pop = std::min(count, (int)list.size());
-                            res = "*" + std::to_string(to_pop) + "\r\n";
-                            for (int i = 0; i < to_pop; ++i) {
-                                res += to_bulk_string(list[0]);
-                                list.erase(list.begin());
-                            }
                         }
                     }
                 }
-                send(client_fd, res.c_str(), res.length(), 0);
             }
-            // --- SET/GET ---
-            else if (command == "set" && parts.size() >= 3) {
-                Node node; node.type = T_STRING; node.string_val = parts[2];
-                if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
-                    node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
-                    node.has_expiry = true;
+            // --- LRANGE ---
+            else if (command == "lrange" && parts.size() >= 4) {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                if (kv_store.count(parts[1]) && kv_store[parts[1]].type == T_LIST) {
+                    auto &list = kv_store[parts[1]].list_val;
+                    int n = list.size();
+                    int start = std::stoi(parts[2]), stop = std::stoi(parts[3]);
+                    if (start < 0) start = n + start;
+                    if (stop < 0) stop = n + stop;
+                    start = std::max(0, start); stop = std::min(n - 1, stop);
+                    if (start >= n || start > stop) {
+                        response = "*0\r\n";
+                    } else {
+                        response = "*" + std::to_string(stop - start + 1) + "\r\n";
+                        for (int i = start; i <= stop; ++i) response += to_bulk_string(list[i]);
+                    }
+                } else {
+                    response = "*0\r\n";
                 }
-                { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = node; }
-                send(client_fd, "+OK\r\n", 5, 0);
+            }
+            // --- SET / GET / PING ---
+            else if (command == "set" && parts.size() >= 3) {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                kv_store[parts[1]] = {T_STRING, parts[2]};
+                response = "+OK\r\n";
             }
             else if (command == "get" && parts.size() >= 2) {
-                std::string res = "$-1\r\n";
-                {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (kv_store.count(parts[1])) {
-                        Node &n = kv_store[parts[1]];
-                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) kv_store.erase(parts[1]);
-                        else if (n.type == T_STRING) res = to_bulk_string(n.string_val);
-                    }
-                }
-                send(client_fd, res.c_str(), res.length(), 0);
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                response = (kv_store.count(parts[1])) ? to_bulk_string(kv_store[parts[1]].string_val) : "$-1\r\n";
             }
-            // --- PING/ECHO ---
             else if (command == "ping") {
-                send(client_fd, "+PONG\r\n", 7, 0);
-            } else if (command == "echo" && parts.size() >= 2) {
-                std::string res = to_bulk_string(parts[1]);
-                send(client_fd, res.c_str(), res.length(), 0);
+                response = "+PONG\r\n";
+            }
+
+            if (!response.empty()) {
+                send(client_fd, response.c_str(), response.length(), 0);
             }
         }
     }
     close(client_fd);
 }
 
-int main(int argc, char **argv) {
-    std::setvbuf(stdout, NULL, _IOLBF, 0);
+int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int reuse = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int reuse = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     struct sockaddr_in addr = {AF_INET, htons(6379), INADDR_ANY};
     bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
     listen(server_fd, 5);
