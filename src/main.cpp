@@ -89,20 +89,28 @@ void handle_client(int client_fd) {
                 }
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
-            } 
-            // --- NEW LPUSH LOGIC ---
-            else if (command == "lpush" && parts.size() >= 3) {
+            } else if (command == "lpush" && parts.size() >= 3) {
                 int new_len = 0;
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     Node &n = kv_store[parts[1]];
                     n.type = T_LIST;
-                    for (size_t i = 2; i < parts.size(); ++i) {
-                        n.list_val.insert(n.list_val.begin(), parts[i]);
-                    }
+                    for (size_t i = 2; i < parts.size(); ++i) n.list_val.insert(n.list_val.begin(), parts[i]);
                     new_len = n.list_val.size();
                 }
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
+                send(client_fd, res.c_str(), res.length(), 0);
+            }
+            // --- NEW LLEN LOGIC ---
+            else if (command == "llen" && parts.size() >= 2) {
+                int length = 0;
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    if (kv_store.count(parts[1]) && kv_store[parts[1]].type == T_LIST) {
+                        length = kv_store[parts[1]].list_val.size();
+                    }
+                }
+                std::string res = ":" + std::to_string(length) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
             }
             else if (command == "lrange" && parts.size() >= 4) {
