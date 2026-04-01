@@ -54,6 +54,7 @@ void handle_client(int client_fd) {
             if (parts.empty()) continue;
             std::string command = to_lowercase(parts[0]);
 
+            // ... (Standard PING, ECHO, SET, GET, RPUSH, LPUSH, LLEN, LRANGE remain same) ...
             if (command == "ping") {
                 send(client_fd, "+PONG\r\n", 7, 0);
             } else if (command == "echo" && parts.size() >= 2) {
@@ -101,17 +102,30 @@ void handle_client(int client_fd) {
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
             }
-            // --- NEW LPOP LOGIC ---
+            // --- UPDATED LPOP LOGIC ---
             else if (command == "lpop" && parts.size() >= 2) {
-                std::string res = "$-1\r\n";
+                std::string res;
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (kv_store.count(parts[1]) && kv_store[parts[1]].type == T_LIST) {
+                    if (!kv_store.count(parts[1]) || kv_store[parts[1]].type != T_LIST || kv_store[parts[1]].list_val.empty()) {
+                        res = "$-1\r\n";
+                    } else {
                         std::vector<std::string> &list = kv_store[parts[1]].list_val;
-                        if (!list.empty()) {
+                        
+                        if (parts.size() == 2) {
+                            // Single LPOP -> Return Bulk String
                             std::string val = list[0];
                             list.erase(list.begin());
                             res = to_bulk_string(val);
+                        } else {
+                            // Multi LPOP -> Return Array
+                            int count = std::stoi(parts[2]);
+                            int to_remove = std::min(count, (int)list.size());
+                            res = "*" + std::to_string(to_remove) + "\r\n";
+                            for (int i = 0; i < to_remove; ++i) {
+                                res += to_bulk_string(list[0]);
+                                list.erase(list.begin());
+                            }
                         }
                     }
                 }
@@ -142,9 +156,8 @@ void handle_client(int client_fd) {
                         if (stop < 0) stop = n + stop;
                         if (start < 0) start = 0;
                         if (stop >= n) stop = n - 1;
-                        if (start >= n || start > stop) {
-                            response = "*0\r\n";
-                        } else {
+                        if (start >= n || start > stop) { response = "*0\r\n"; }
+                        else {
                             int count = stop - start + 1;
                             response = "*" + std::to_string(count) + "\r\n";
                             for (int i = start; i <= stop; ++i) response += to_bulk_string(list[i]);
