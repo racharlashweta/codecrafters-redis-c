@@ -54,7 +54,6 @@ void handle_client(int client_fd) {
             if (parts.empty()) continue;
             std::string command = to_lowercase(parts[0]);
 
-            // ... (PING, ECHO, SET, GET, RPUSH remain same as previous stage) ...
             if (command == "ping") {
                 send(client_fd, "+PONG\r\n", 7, 0);
             } else if (command == "echo" && parts.size() >= 2) {
@@ -90,40 +89,44 @@ void handle_client(int client_fd) {
                 }
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
+            } 
+            // --- NEW LPUSH LOGIC ---
+            else if (command == "lpush" && parts.size() >= 3) {
+                int new_len = 0;
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    Node &n = kv_store[parts[1]];
+                    n.type = T_LIST;
+                    for (size_t i = 2; i < parts.size(); ++i) {
+                        n.list_val.insert(n.list_val.begin(), parts[i]);
+                    }
+                    new_len = n.list_val.size();
+                }
+                std::string res = ":" + std::to_string(new_len) + "\r\n";
+                send(client_fd, res.c_str(), res.length(), 0);
             }
-            // --- UPDATED LRANGE LOGIC ---
             else if (command == "lrange" && parts.size() >= 4) {
                 std::string key = parts[1];
                 int start = std::stoi(parts[2]);
                 int stop = std::stoi(parts[3]);
                 std::string response;
-
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (kv_store.count(key) && kv_store[key].type == T_LIST) {
                         std::vector<std::string> &list = kv_store[key].list_val;
                         int n = (int)list.size();
-
-                        // Normalize Negative Indexes
                         if (start < 0) start = n + start;
                         if (stop < 0) stop = n + stop;
-
-                        // Clamping
                         if (start < 0) start = 0;
                         if (stop >= n) stop = n - 1;
-
                         if (start >= n || start > stop) {
                             response = "*0\r\n";
                         } else {
                             int count = stop - start + 1;
                             response = "*" + std::to_string(count) + "\r\n";
-                            for (int i = start; i <= stop; ++i) {
-                                response += to_bulk_string(list[i]);
-                            }
+                            for (int i = start; i <= stop; ++i) response += to_bulk_string(list[i]);
                         }
-                    } else {
-                        response = "*0\r\n";
-                    }
+                    } else { response = "*0\r\n"; }
                 }
                 send(client_fd, response.c_str(), response.length(), 0);
             }
