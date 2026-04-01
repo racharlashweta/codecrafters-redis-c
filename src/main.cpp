@@ -29,7 +29,6 @@ std::string to_lowercase(std::string s) {
     return s;
 }
 
-// Helper to format a string into a RESP Bulk String
 std::string to_bulk_string(const std::string& s) {
     return "$" + std::to_string(s.length()) + "\r\n" + s + "\r\n";
 }
@@ -55,14 +54,13 @@ void handle_client(int client_fd) {
             if (parts.empty()) continue;
             std::string command = to_lowercase(parts[0]);
 
+            // ... (PING, ECHO, SET, GET, RPUSH remain same as previous stage) ...
             if (command == "ping") {
                 send(client_fd, "+PONG\r\n", 7, 0);
-            } 
-            else if (command == "echo" && parts.size() >= 2) {
+            } else if (command == "echo" && parts.size() >= 2) {
                 std::string res = to_bulk_string(parts[1]);
                 send(client_fd, res.c_str(), res.length(), 0);
-            }
-            else if (command == "set" && parts.size() >= 3) {
+            } else if (command == "set" && parts.size() >= 3) {
                 Node node; node.type = T_STRING; node.string_val = parts[2];
                 if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
                     node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
@@ -70,8 +68,7 @@ void handle_client(int client_fd) {
                 }
                 { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = node; }
                 send(client_fd, "+OK\r\n", 5, 0);
-            }
-            else if (command == "get" && parts.size() >= 2) {
+            } else if (command == "get" && parts.size() >= 2) {
                 std::string res = "$-1\r\n";
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
@@ -82,8 +79,7 @@ void handle_client(int client_fd) {
                     }
                 }
                 send(client_fd, res.c_str(), res.length(), 0);
-            }
-            else if (command == "rpush" && parts.size() >= 3) {
+            } else if (command == "rpush" && parts.size() >= 3) {
                 int new_len = 0;
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
@@ -95,6 +91,7 @@ void handle_client(int client_fd) {
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
             }
+            // --- UPDATED LRANGE LOGIC ---
             else if (command == "lrange" && parts.size() >= 4) {
                 std::string key = parts[1];
                 int start = std::stoi(parts[2]);
@@ -105,8 +102,14 @@ void handle_client(int client_fd) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (kv_store.count(key) && kv_store[key].type == T_LIST) {
                         std::vector<std::string> &list = kv_store[key].list_val;
-                        int n = list.size();
-                        if (start < 0) start = 0; // Simple handling for non-negative stage
+                        int n = (int)list.size();
+
+                        // Normalize Negative Indexes
+                        if (start < 0) start = n + start;
+                        if (stop < 0) stop = n + stop;
+
+                        // Clamping
+                        if (start < 0) start = 0;
                         if (stop >= n) stop = n - 1;
 
                         if (start >= n || start > stop) {
