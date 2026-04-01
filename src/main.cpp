@@ -72,8 +72,27 @@ void handle_client(int client_fd) {
                 std::string command = to_lowercase(parts[0]);
                 std::string response = "";
 
+                // --- XADD ---
+                if (command == "xadd" && parts.size() >= 4) {
+                    std::string key = parts[1];
+                    std::string id = parts[2];
+                    StreamEntry entry;
+                    entry.id = id;
+                    
+                    for (size_t i = 3; i + 1 < parts.size(); i += 2) {
+                        entry.fields[parts[i]] = parts[i+1];
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(kv_mutex);
+                        Node &n = kv_store[key];
+                        n.type = T_STREAM;
+                        n.stream_val.push_back(entry);
+                    }
+                    response = to_bulk_string(id);
+                }
                 // --- LLEN ---
-                if (command == "llen" && parts.size() >= 2) {
+                else if (command == "llen" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = ":0\r\n";
                     else if (kv_store[parts[1]].type != T_LIST) response = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
@@ -136,7 +155,7 @@ void handle_client(int client_fd) {
                     }
                     cv.notify_all();
                 }
-                // --- GET / SET / PING / ECHO ---
+                // --- GET / SET / PING / TYPE / ECHO ---
                 else if (command == "set" && parts.size() >= 3) {
                     Node n; n.type = T_STRING; n.string_val = parts[2];
                     if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
@@ -155,8 +174,6 @@ void handle_client(int client_fd) {
                         } else response = to_bulk_string(n.string_val);
                     } else response = "$-1\r\n";
                 }
-                else if (command == "ping") response = "+PONG\r\n";
-                else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
                 else if (command == "type" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = "+none\r\n";
@@ -167,6 +184,8 @@ void handle_client(int client_fd) {
                         else response = "+string\r\n";
                     }
                 }
+                else if (command == "ping") response = "+PONG\r\n";
+                else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
                 else response = "-ERR unknown command\r\n";
 
                 if (!response.empty()) send(client_fd, response.c_str(), response.length(), 0);
