@@ -34,6 +34,19 @@ std::unordered_map<std::string, Node> kv_store;
 std::mutex kv_mutex;
 std::condition_variable cv;
 
+// Helper to parse "ms-seq" into two long longs
+bool parse_id(const std::string& id_str, long long& ms, long long& seq) {
+    size_t dash_pos = id_str.find('-');
+    if (dash_pos == std::string::npos) return false;
+    try {
+        ms = std::stoll(id_str.substr(0, dash_pos));
+        seq = std::stoll(id_str.substr(dash_pos + 1));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::string to_lowercase(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
     return s;
@@ -72,59 +85,52 @@ void handle_client(int client_fd) {
                 std::string command = to_lowercase(parts[0]);
                 std::string response = "";
 
-                // --- BLPOP ---
-                if (command == "blpop" && parts.size() >= 3) {
+                // --- XADD with ID Validation ---
+                if (command == "xadd" && parts.size() >= 4) {
                     std::string key = parts[1];
-                    double timeout_sec = std::stod(parts[2]);
-                    std::unique_lock<std::mutex> lock(kv_mutex);
-                    
-                    auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
+                    std::string id_str = parts[2];
+                    long long new_ms, new_seq;
 
-                    bool ready = false;
-                    if (timeout_sec == 0) {
-                        cv.wait(lock, pred);
-                        ready = true;
+                    if (!parse_id(id_str, new_ms, new_seq)) {
+                        response = "-ERR Invalid ID format\r\n";
+                    } else if (new_ms == 0 && new_seq == 0) {
+                        response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
                     } else {
-                        ready = cv.wait_for(lock, std::chrono::duration<double>(timeout_sec), pred);
-                    }
-
-                    if (ready) {
-                        std::string val = kv_store[key].list_val.front();
-                        kv_store[key].list_val.pop_front();
-                        response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
-                    } else {
-                        response = "*-1\r\n"; // Standard Redis Null Array for BLPOP timeout
-                    }
-                }
-                // --- XADD ---
-                else if (command == "xadd" && parts.size() >= 4) {
-                    std::string key = parts[1];
-                    std::string id = parts[2];
-                    StreamEntry entry;
-                    entry.id = id;
-                    for (size_t i = 3; i + 1 < parts.size(); i += 2) {
-                        entry.fields[parts[i]] = parts[i+1];
-                    }
-                    {
                         std::lock_guard<std::mutex> lock(kv_mutex);
                         Node &n = kv_store[key];
                         n.type = T_STREAM;
-                        n.stream_val.push_back(entry);
+
+                        bool is_valid = true;
+                        if (!n.stream_val.empty()) {
+                            long long last_ms, last_seq;
+                            parse_id(n.stream_val.back().id, last_ms, last_seq);
+
+                            if (new_ms < last_ms || (new_ms == last_ms && new_seq <= last_seq)) {
+                                response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
+                                is_valid = false;
+                            }
+                        }
+
+                        if (is_valid) {
+                            StreamEntry entry;
+                            entry.id = id_str;
+                            for (size_t i = 3; i + 1 < parts.size(); i += 2) {
+                                entry.fields[parts[i]] = parts[i+1];
+                            }
+                            n.stream_val.push_back(entry);
+                            response = to_bulk_string(id_str);
+                        }
                     }
-                    response = to_bulk_string(id);
                 }
-                // --- LLEN ---
+                // --- (Rest of the commands: LLEN, LRANGE, LPOP, RPUSH, SET, GET, etc.) ---
                 else if (command == "llen" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = ":0\r\n";
-                    else if (kv_store[parts[1]].type != T_LIST) response = "-WRONGTYPE Operation\r\n";
                     else response = ":" + std::to_string(kv_store[parts[1]].list_val.size()) + "\r\n";
                 }
-                // --- LRANGE ---
                 else if (command == "lrange" && parts.size() >= 4) {
                     std::string key = parts[1];
-                    int start = std::stoi(parts[2]);
-                    int end = std::stoi(parts[3]);
+                    int start = std::stoi(parts[2]), end = std::stoi(parts[3]);
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(key)) response = "*0\r\n";
                     else {
@@ -141,7 +147,6 @@ void handle_client(int client_fd) {
                         }
                     }
                 }
-                // --- LPOP ---
                 else if (command == "lpop" && parts.size() >= 2) {
                     std::string key = parts[1];
                     int count = (parts.size() >= 3) ? std::stoi(parts[2]) : 1;
@@ -162,7 +167,21 @@ void handle_client(int client_fd) {
                         }
                     }
                 }
-                // --- RPUSH / LPUSH ---
+                else if (command == "blpop" && parts.size() >= 3) {
+                    std::string key = parts[1];
+                    double timeout = std::stod(parts[2]);
+                    std::unique_lock<std::mutex> lock(kv_mutex);
+                    auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
+                    bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
+                    if (ready) {
+                        std::string val = kv_store[key].list_val.front();
+                        kv_store[key].list_val.pop_front();
+                        response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                    } else response = "*-1\r\n";
+                    lock.unlock();
+                    send(client_fd, response.c_str(), response.length(), 0);
+                    response = ""; 
+                }
                 else if (command == "rpush" || command == "lpush") {
                     {
                         std::lock_guard<std::mutex> lock(kv_mutex);
@@ -176,7 +195,6 @@ void handle_client(int client_fd) {
                     }
                     cv.notify_all();
                 }
-                // --- CORE COMMANDS ---
                 else if (command == "set" && parts.size() >= 3) {
                     Node n; n.type = T_STRING; n.string_val = parts[2];
                     if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
