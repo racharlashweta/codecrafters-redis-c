@@ -11,20 +11,16 @@
 #include <mutex>
 #include <chrono>
 
-// Define types of data our Redis clone can store
 enum DataType { T_STRING, T_LIST };
 
 struct Node {
     DataType type = T_STRING;
     std::string string_val;
     std::vector<std::string> list_val;
-    
-    // Expiry tracking
     std::chrono::steady_clock::time_point expiry;
     bool has_expiry = false;
 };
 
-// Global Store and Mutex for Thread Safety
 std::unordered_map<std::string, Node> kv_store;
 std::mutex kv_mutex;
 
@@ -33,27 +29,26 @@ std::string to_lowercase(std::string s) {
     return s;
 }
 
+// Helper to format a string into a RESP Bulk String
+std::string to_bulk_string(const std::string& s) {
+    return "$" + std::to_string(s.length()) + "\r\n" + s + "\r\n";
+}
+
 void handle_client(int client_fd) {
     char buffer[1024];
     while (true) {
         memset(buffer, 0, sizeof(buffer));
         ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer), 0);
-        
         if (bytes_received <= 0) break;
 
         std::string input(buffer, bytes_received);
-        
         if (input[0] == '*') {
             std::vector<std::string> parts;
             size_t pos = 0;
             std::string temp = input;
-
-            // RESP Tokenizer: Extract data between \r\n markers
             while ((pos = temp.find("\r\n")) != std::string::npos) {
                 std::string line = temp.substr(0, pos);
-                if (line[0] != '*' && line[0] != '$') {
-                    parts.push_back(line);
-                }
+                if (line[0] != '*' && line[0] != '$') parts.push_back(line);
                 temp.erase(0, pos + 2);
             }
 
@@ -64,63 +59,69 @@ void handle_client(int client_fd) {
                 send(client_fd, "+PONG\r\n", 7, 0);
             } 
             else if (command == "echo" && parts.size() >= 2) {
-                std::string response = "$" + std::to_string(parts[1].length()) + "\r\n" + parts[1] + "\r\n";
-                send(client_fd, response.c_str(), response.length(), 0);
+                std::string res = to_bulk_string(parts[1]);
+                send(client_fd, res.c_str(), res.length(), 0);
             }
             else if (command == "set" && parts.size() >= 3) {
-                Node node;
-                node.type = T_STRING;
-                node.string_val = parts[2];
-                
-                // Handle PX <milliseconds>
+                Node node; node.type = T_STRING; node.string_val = parts[2];
                 if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
-                    long long ms = std::stoll(parts[4]);
-                    node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+                    node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
                     node.has_expiry = true;
                 }
-
-                {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    kv_store[parts[1]] = node;
-                }
+                { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = node; }
                 send(client_fd, "+OK\r\n", 5, 0);
             }
             else if (command == "get" && parts.size() >= 2) {
-                std::string key = parts[1];
-                std::string response = "$-1\r\n"; 
-
+                std::string res = "$-1\r\n";
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (kv_store.count(key)) {
-                        Node &node = kv_store[key];
-                        auto now = std::chrono::steady_clock::now();
-                        
-                        // Passive Expiry Check
-                        if (node.has_expiry && now >= node.expiry) {
-                            kv_store.erase(key);
-                        } else if (node.type == T_STRING) {
-                            response = "$" + std::to_string(node.string_val.length()) + "\r\n" + node.string_val + "\r\n";
-                        }
+                    if (kv_store.count(parts[1])) {
+                        Node &n = kv_store[parts[1]];
+                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) kv_store.erase(parts[1]);
+                        else if (n.type == T_STRING) res = to_bulk_string(n.string_val);
                     }
                 }
-                send(client_fd, response.c_str(), response.length(), 0);
+                send(client_fd, res.c_str(), res.length(), 0);
             }
             else if (command == "rpush" && parts.size() >= 3) {
-                std::string key = parts[1];
                 int new_len = 0;
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    Node &n = kv_store[parts[1]];
+                    n.type = T_LIST;
+                    for (size_t i = 2; i < parts.size(); ++i) n.list_val.push_back(parts[i]);
+                    new_len = n.list_val.size();
+                }
+                std::string res = ":" + std::to_string(new_len) + "\r\n";
+                send(client_fd, res.c_str(), res.length(), 0);
+            }
+            else if (command == "lrange" && parts.size() >= 4) {
+                std::string key = parts[1];
+                int start = std::stoi(parts[2]);
+                int stop = std::stoi(parts[3]);
+                std::string response;
 
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    Node &node = kv_store[key];
-                    node.type = T_LIST;
-                    for (size_t i = 2; i < parts.size(); ++i) {
-                        node.list_val.push_back(parts[i]);
-                    }
-                    new_len = node.list_val.size();
-                }
+                    if (kv_store.count(key) && kv_store[key].type == T_LIST) {
+                        std::vector<std::string> &list = kv_store[key].list_val;
+                        int n = list.size();
+                        if (start < 0) start = 0; // Simple handling for non-negative stage
+                        if (stop >= n) stop = n - 1;
 
-                // RPUSH returns integer response: :<length>\r\n
-                std::string response = ":" + std::to_string(new_len) + "\r\n";
+                        if (start >= n || start > stop) {
+                            response = "*0\r\n";
+                        } else {
+                            int count = stop - start + 1;
+                            response = "*" + std::to_string(count) + "\r\n";
+                            for (int i = start; i <= stop; ++i) {
+                                response += to_bulk_string(list[i]);
+                            }
+                        }
+                    } else {
+                        response = "*0\r\n";
+                    }
+                }
                 send(client_fd, response.c_str(), response.length(), 0);
             }
         }
@@ -130,20 +131,15 @@ void handle_client(int client_fd) {
 
 int main(int argc, char **argv) {
     std::setvbuf(stdout, NULL, _IOLBF, 0);
-    
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int reuse = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
     struct sockaddr_in addr = {AF_INET, htons(6379), INADDR_ANY};
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) return 1;
+    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
     listen(server_fd, 5);
-
     while (true) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd > 0) {
-            std::thread(handle_client, client_fd).detach();
-        }
+        int cf = accept(server_fd, NULL, NULL);
+        if (cf > 0) std::thread(handle_client, cf).detach();
     }
     return 0;
 }
