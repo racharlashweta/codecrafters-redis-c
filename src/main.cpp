@@ -40,7 +40,9 @@ bool parse_id(const std::string& id_str, long long& ms, long long& seq) {
     if (dash_pos == std::string::npos) return false;
     try {
         ms = std::stoll(id_str.substr(0, dash_pos));
-        seq = std::stoll(id_str.substr(dash_pos + 1));
+        std::string seq_part = id_str.substr(dash_pos + 1);
+        if (seq_part == "*") return false; // Handle * separately in logic
+        seq = std::stoll(seq_part);
         return true;
     } catch (...) {
         return false;
@@ -85,108 +87,92 @@ void handle_client(int client_fd) {
                 std::string command = to_lowercase(parts[0]);
                 std::string response = "";
 
-                // --- XADD with ID Validation ---
                 if (command == "xadd" && parts.size() >= 4) {
                     std::string key = parts[1];
-                    std::string id_str = parts[2];
-                    long long new_ms, new_seq;
+                    std::string id_input = parts[2];
+                    std::string final_id = "";
+                    
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    Node &n = kv_store[key];
+                    n.type = T_STREAM;
 
-                    if (!parse_id(id_str, new_ms, new_seq)) {
-                        response = "-ERR Invalid ID format\r\n";
-                    } else if (new_ms == 0 && new_seq == 0) {
-                        response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+                    long long last_ms = -1, last_seq = -1;
+                    if (!n.stream_val.empty()) {
+                        parse_id(n.stream_val.back().id, last_ms, last_seq);
+                    }
+
+                    // Handle sequence auto-generation: "ms-*"
+                    if (id_input.find("-*") != std::string::npos) {
+                        long long ms = std::stoll(id_input.substr(0, id_input.find('-')));
+                        long long seq;
+
+                        if (ms == 0) {
+                            // If ms is 0, sequence starts at 1, or increments
+                            seq = (last_ms == 0) ? last_seq + 1 : 1;
+                        } else {
+                            if (ms == last_ms) seq = last_seq + 1;
+                            else seq = 0;
+                        }
+                        final_id = std::to_string(ms) + "-" + std::to_string(seq);
                     } else {
-                        std::lock_guard<std::mutex> lock(kv_mutex);
-                        Node &n = kv_store[key];
-                        n.type = T_STREAM;
+                        final_id = id_input;
+                    }
 
-                        bool is_valid = true;
-                        if (!n.stream_val.empty()) {
-                            long long last_ms, last_seq;
-                            parse_id(n.stream_val.back().id, last_ms, last_seq);
-
-                            if (new_ms < last_ms || (new_ms == last_ms && new_seq <= last_seq)) {
-                                response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
-                                is_valid = false;
-                            }
+                    // Validation Logic
+                    long long n_ms, n_seq;
+                    if (!parse_id(final_id, n_ms, n_seq)) {
+                         response = "-ERR Invalid ID format\r\n";
+                    } else if (n_ms == 0 && n_seq == 0) {
+                        response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+                    } else if (last_ms != -1 && (n_ms < last_ms || (n_ms == last_ms && n_seq <= last_seq))) {
+                        response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
+                    } else {
+                        StreamEntry entry;
+                        entry.id = final_id;
+                        for (size_t i = 3; i + 1 < parts.size(); i += 2) {
+                            entry.fields[parts[i]] = parts[i+1];
                         }
-
-                        if (is_valid) {
-                            StreamEntry entry;
-                            entry.id = id_str;
-                            for (size_t i = 3; i + 1 < parts.size(); i += 2) {
-                                entry.fields[parts[i]] = parts[i+1];
-                            }
-                            n.stream_val.push_back(entry);
-                            response = to_bulk_string(id_str);
-                        }
+                        n.stream_val.push_back(entry);
+                        response = to_bulk_string(final_id);
                     }
                 }
-                // --- (Rest of the commands: LLEN, LRANGE, LPOP, RPUSH, SET, GET, etc.) ---
                 else if (command == "llen" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (!kv_store.count(parts[1])) response = ":0\r\n";
-                    else response = ":" + std::to_string(kv_store[parts[1]].list_val.size()) + "\r\n";
+                    response = ":" + std::to_string(kv_store[parts[1]].list_val.size()) + "\r\n";
                 }
                 else if (command == "lrange" && parts.size() >= 4) {
                     std::string key = parts[1];
                     int start = std::stoi(parts[2]), end = std::stoi(parts[3]);
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (!kv_store.count(key)) response = "*0\r\n";
+                    auto &list = kv_store[key].list_val;
+                    int size = (int)list.size();
+                    if (start < 0) start = size + start;
+                    if (end < 0) end = size + end;
+                    start = std::max(0, start); end = std::min(size - 1, end);
+                    if (start > end || start >= size) response = "*0\r\n";
                     else {
-                        auto &list = kv_store[key].list_val;
-                        int size = (int)list.size();
-                        if (start < 0) start = size + start;
-                        if (end < 0) end = size + end;
-                        start = std::max(0, start);
-                        end = std::min(size - 1, end);
-                        if (start > end || start >= size) response = "*0\r\n";
-                        else {
-                            response = "*" + std::to_string(end - start + 1) + "\r\n";
-                            for (int i = start; i <= end; ++i) response += to_bulk_string(list[i]);
-                        }
+                        response = "*" + std::to_string(end - start + 1) + "\r\n";
+                        for (int i = start; i <= end; ++i) response += to_bulk_string(list[i]);
                     }
                 }
                 else if (command == "lpop" && parts.size() >= 2) {
                     std::string key = parts[1];
                     int count = (parts.size() >= 3) ? std::stoi(parts[2]) : 1;
                     std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (!kv_store.count(key) || kv_store[key].list_val.empty()) response = "$-1\r\n";
+                    auto &list = kv_store[key].list_val;
+                    if (list.empty()) response = "$-1\r\n";
                     else {
-                        auto &list = kv_store[key].list_val;
-                        int to_remove = std::min((int)list.size(), count);
+                        int to_rem = std::min((int)list.size(), count);
                         if (parts.size() >= 3) {
-                            response = "*" + std::to_string(to_remove) + "\r\n";
-                            for (int i = 0; i < to_remove; ++i) {
-                                response += to_bulk_string(list.front());
-                                list.pop_front();
-                            }
-                        } else {
-                            response = to_bulk_string(list.front());
-                            list.pop_front();
-                        }
+                            response = "*" + std::to_string(to_rem) + "\r\n";
+                            while(to_rem--) { response += to_bulk_string(list.front()); list.pop_front(); }
+                        } else { response = to_bulk_string(list.front()); list.pop_front(); }
                     }
-                }
-                else if (command == "blpop" && parts.size() >= 3) {
-                    std::string key = parts[1];
-                    double timeout = std::stod(parts[2]);
-                    std::unique_lock<std::mutex> lock(kv_mutex);
-                    auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
-                    bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
-                    if (ready) {
-                        std::string val = kv_store[key].list_val.front();
-                        kv_store[key].list_val.pop_front();
-                        response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
-                    } else response = "*-1\r\n";
-                    lock.unlock();
-                    send(client_fd, response.c_str(), response.length(), 0);
-                    response = ""; 
                 }
                 else if (command == "rpush" || command == "lpush") {
                     {
                         std::lock_guard<std::mutex> lock(kv_mutex);
-                        Node &n = kv_store[parts[1]];
-                        n.type = T_LIST;
+                        Node &n = kv_store[parts[1]]; n.type = T_LIST;
                         for (size_t i = 2; i < parts.size(); ++i) {
                             if (command == "rpush") n.list_val.push_back(parts[i]);
                             else n.list_val.push_front(parts[i]);
@@ -213,7 +199,6 @@ void handle_client(int client_fd) {
                         } else response = to_bulk_string(n.string_val);
                     } else response = "$-1\r\n";
                 }
-                else if (command == "ping") response = "+PONG\r\n";
                 else if (command == "type" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = "+none\r\n";
@@ -224,6 +209,7 @@ void handle_client(int client_fd) {
                         else response = "+string\r\n";
                     }
                 }
+                else if (command == "ping") response = "+PONG\r\n";
                 else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
                 else response = "-ERR unknown command\r\n";
 
