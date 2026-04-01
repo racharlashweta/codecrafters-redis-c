@@ -72,17 +72,39 @@ void handle_client(int client_fd) {
                 std::string command = to_lowercase(parts[0]);
                 std::string response = "";
 
+                // --- BLPOP ---
+                if (command == "blpop" && parts.size() >= 3) {
+                    std::string key = parts[1];
+                    double timeout_sec = std::stod(parts[2]);
+                    std::unique_lock<std::mutex> lock(kv_mutex);
+                    
+                    auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
+
+                    bool ready = false;
+                    if (timeout_sec == 0) {
+                        cv.wait(lock, pred);
+                        ready = true;
+                    } else {
+                        ready = cv.wait_for(lock, std::chrono::duration<double>(timeout_sec), pred);
+                    }
+
+                    if (ready) {
+                        std::string val = kv_store[key].list_val.front();
+                        kv_store[key].list_val.pop_front();
+                        response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                    } else {
+                        response = "*-1\r\n"; // Standard Redis Null Array for BLPOP timeout
+                    }
+                }
                 // --- XADD ---
-                if (command == "xadd" && parts.size() >= 4) {
+                else if (command == "xadd" && parts.size() >= 4) {
                     std::string key = parts[1];
                     std::string id = parts[2];
                     StreamEntry entry;
                     entry.id = id;
-                    
                     for (size_t i = 3; i + 1 < parts.size(); i += 2) {
                         entry.fields[parts[i]] = parts[i+1];
                     }
-
                     {
                         std::lock_guard<std::mutex> lock(kv_mutex);
                         Node &n = kv_store[key];
@@ -95,7 +117,7 @@ void handle_client(int client_fd) {
                 else if (command == "llen" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = ":0\r\n";
-                    else if (kv_store[parts[1]].type != T_LIST) response = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+                    else if (kv_store[parts[1]].type != T_LIST) response = "-WRONGTYPE Operation\r\n";
                     else response = ":" + std::to_string(kv_store[parts[1]].list_val.size()) + "\r\n";
                 }
                 // --- LRANGE ---
@@ -105,7 +127,6 @@ void handle_client(int client_fd) {
                     int end = std::stoi(parts[3]);
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(key)) response = "*0\r\n";
-                    else if (kv_store[key].type != T_LIST) response = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
                     else {
                         auto &list = kv_store[key].list_val;
                         int size = (int)list.size();
@@ -155,7 +176,7 @@ void handle_client(int client_fd) {
                     }
                     cv.notify_all();
                 }
-                // --- GET / SET / PING / TYPE / ECHO ---
+                // --- CORE COMMANDS ---
                 else if (command == "set" && parts.size() >= 3) {
                     Node n; n.type = T_STRING; n.string_val = parts[2];
                     if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
@@ -174,6 +195,7 @@ void handle_client(int client_fd) {
                         } else response = to_bulk_string(n.string_val);
                     } else response = "$-1\r\n";
                 }
+                else if (command == "ping") response = "+PONG\r\n";
                 else if (command == "type" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = "+none\r\n";
@@ -184,7 +206,6 @@ void handle_client(int client_fd) {
                         else response = "+string\r\n";
                     }
                 }
-                else if (command == "ping") response = "+PONG\r\n";
                 else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
                 else response = "-ERR unknown command\r\n";
 
