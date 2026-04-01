@@ -56,35 +56,8 @@ void handle_client(int client_fd) {
             if (parts.empty()) continue;
             std::string command = to_lowercase(parts[0]);
 
-            if (command == "ping") {
-                send(client_fd, "+PONG\r\n", 7, 0);
-            } 
-            else if (command == "echo" && parts.size() >= 2) {
-                std::string res = to_bulk_string(parts[1]);
-                send(client_fd, res.c_str(), res.length(), 0);
-            }
-            else if (command == "set" && parts.size() >= 3) {
-                Node node; node.type = T_STRING; node.string_val = parts[2];
-                if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
-                    node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
-                    node.has_expiry = true;
-                }
-                { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = node; }
-                send(client_fd, "+OK\r\n", 5, 0);
-            }
-            else if (command == "get" && parts.size() >= 2) {
-                std::string res = "$-1\r\n";
-                {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (kv_store.count(parts[1])) {
-                        Node &n = kv_store[parts[1]];
-                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) kv_store.erase(parts[1]);
-                        else if (n.type == T_STRING) res = to_bulk_string(n.string_val);
-                    }
-                }
-                send(client_fd, res.c_str(), res.length(), 0);
-            }
-            else if (command == "rpush" || command == "lpush") {
+            // Handle RPUSH/LPUSH and notify waiters
+            if (command == "rpush" || command == "lpush") {
                 int new_len = 0;
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
@@ -100,47 +73,73 @@ void handle_client(int client_fd) {
                 std::string res = ":" + std::to_string(new_len) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
             }
-            else if (command == "lpop" && parts.size() >= 2) {
-                std::string res;
-                {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (!kv_store.count(parts[1]) || kv_store[parts[1]].type != T_LIST || kv_store[parts[1]].list_val.empty()) {
-                        res = "$-1\r\n";
-                    } else {
-                        std::vector<std::string> &list = kv_store[parts[1]].list_val;
-                        if (parts.size() == 2) {
-                            std::string val = list[0];
-                            list.erase(list.begin());
-                            res = to_bulk_string(val);
-                        } else {
-                            int count = std::stoi(parts[2]);
-                            int to_pop = std::min(count, (int)list.size());
-                            res = "*" + std::to_string(to_pop) + "\r\n";
-                            for (int i = 0; i < to_pop; ++i) {
-                                res += to_bulk_string(list[0]);
-                                list.erase(list.begin());
-                            }
-                        }
-                    }
-                }
-                send(client_fd, res.c_str(), res.length(), 0);
-            }
+            // --- UPDATED BLPOP WITH TIMEOUT ---
             else if (command == "blpop" && parts.size() >= 3) {
                 std::string key = parts[1];
+                double timeout_secs = std::stod(parts[2]);
                 std::string res;
-                {
-                    std::unique_lock<std::mutex> lock(kv_mutex);
-                    cv.wait(lock, [&key] {
-                        return kv_store.count(key) && !kv_store[key].list_val.empty();
-                    });
+
+                std::unique_lock<std::mutex> lock(kv_mutex);
+                auto predicate = [&key] {
+                    return kv_store.count(key) && !kv_store[key].list_val.empty();
+                };
+
+                bool success = true;
+                if (timeout_secs == 0) {
+                    cv.wait(lock, predicate);
+                } else {
+                    auto timeout_duration = std::chrono::duration<double>(timeout_secs);
+                    success = cv.wait_for(lock, timeout_duration, predicate);
+                }
+
+                if (success) {
                     std::vector<std::string> &list = kv_store[key].list_val;
                     std::string val = list[0];
                     list.erase(list.begin());
                     res = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                } else {
+                    // Timeout reached - return Null Array
+                    res = "*-1\r\n";
                 }
                 send(client_fd, res.c_str(), res.length(), 0);
             }
-            else if (command == "llen" && parts.size() >= 2) {
+            // --- Rest of commands (SET, GET, LPOP, LLEN, LRANGE) ---
+            else if (command == "ping") {
+                send(client_fd, "+PONG\r\n", 7, 0);
+            } else if (command == "echo" && parts.size() >= 2) {
+                std::string res = to_bulk_string(parts[1]);
+                send(client_fd, res.c_str(), res.length(), 0);
+            } else if (command == "set" && parts.size() >= 3) {
+                Node node; node.type = T_STRING; node.string_val = parts[2];
+                if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
+                    node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
+                    node.has_expiry = true;
+                }
+                { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = node; }
+                send(client_fd, "+OK\r\n", 5, 0);
+            } else if (command == "get" && parts.size() >= 2) {
+                std::string res = "$-1\r\n";
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    if (kv_store.count(parts[1])) {
+                        Node &n = kv_store[parts[1]];
+                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) kv_store.erase(parts[1]);
+                        else if (n.type == T_STRING) res = to_bulk_string(n.string_val);
+                    }
+                }
+                send(client_fd, res.c_str(), res.length(), 0);
+            } else if (command == "lpop" && parts.size() >= 2) {
+                std::string res = "$-1\r\n";
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    if (kv_store.count(parts[1]) && !kv_store[parts[1]].list_val.empty()) {
+                        std::string val = kv_store[parts[1]].list_val[0];
+                        kv_store[parts[1]].list_val.erase(kv_store[parts[1]].list_val.begin());
+                        res = to_bulk_string(val);
+                    }
+                }
+                send(client_fd, res.c_str(), res.length(), 0);
+            } else if (command == "llen" && parts.size() >= 2) {
                 int length = 0;
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
@@ -149,20 +148,17 @@ void handle_client(int client_fd) {
                 }
                 std::string res = ":" + std::to_string(length) + "\r\n";
                 send(client_fd, res.c_str(), res.length(), 0);
-            }
-            else if (command == "lrange" && parts.size() >= 4) {
+            } else if (command == "lrange" && parts.size() >= 4) {
                 std::string res;
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (kv_store.count(parts[1]) && kv_store[parts[1]].type == T_LIST) {
                         std::vector<std::string> &list = kv_store[parts[1]].list_val;
                         int n = (int)list.size();
-                        int start = std::stoi(parts[2]);
-                        int stop = std::stoi(parts[3]);
+                        int start = std::stoi(parts[2]), stop = std::stoi(parts[3]);
                         if (start < 0) start = n + start;
                         if (stop < 0) stop = n + stop;
-                        start = std::max(0, start);
-                        stop = std::min(n - 1, stop);
+                        start = std::max(0, start); stop = std::min(n - 1, stop);
                         if (start >= n || start > stop) { res = "*0\r\n"; }
                         else {
                             res = "*" + std::to_string(stop - start + 1) + "\r\n";
