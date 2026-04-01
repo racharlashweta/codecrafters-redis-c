@@ -24,7 +24,7 @@ struct Node {
     DataType type = T_STRING;
     std::string string_val;
     std::vector<std::string> list_val;
-    std::vector<StreamEntry> stream_val; // New storage for streams
+    std::vector<StreamEntry> stream_val;
     std::chrono::steady_clock::time_point expiry;
     bool has_expiry = false;
 };
@@ -71,60 +71,52 @@ void handle_client(int client_fd) {
                 std::string command = to_lowercase(parts[0]);
                 std::string response = "";
 
-                // --- XADD ---
+                // --- STREAMS: XADD ---
                 if (command == "xadd" && parts.size() >= 4) {
-                    std::string key = parts[1];
-                    std::string id = parts[2];
                     StreamEntry entry;
-                    entry.id = id;
-                    
+                    entry.id = parts[2];
                     for (size_t i = 3; i + 1 < parts.size(); i += 2) {
                         entry.fields[parts[i]] = parts[i+1];
                     }
-
                     {
                         std::lock_guard<std::mutex> lock(kv_mutex);
-                        Node &n = kv_store[key];
+                        Node &n = kv_store[parts[1]];
                         n.type = T_STREAM;
                         n.stream_val.push_back(entry);
                     }
-                    response = to_bulk_string(id);
+                    response = to_bulk_string(entry.id);
                 }
                 // --- TYPE ---
                 else if (command == "type" && parts.size() >= 2) {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     if (!kv_store.count(parts[1])) response = "+none\r\n";
                     else {
-                        Node &n = kv_store[parts[1]];
-                        if (n.type == T_STREAM) response = "+stream\r\n";
-                        else if (n.type == T_LIST) response = "+list\r\n";
+                        DataType t = kv_store[parts[1]].type;
+                        if (t == T_STREAM) response = "+stream\r\n";
+                        else if (t == T_LIST) response = "+list\r\n";
                         else response = "+string\r\n";
                     }
                 }
-                // --- SET / GET ---
-                else if (command == "set" && parts.size() >= 3) {
-                    Node node; node.type = T_STRING; node.string_val = parts[2];
-                    if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
-                        node.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
-                        node.has_expiry = true;
-                    }
-                    { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = node; }
-                    response = "+OK\r\n";
+                // --- BLPOP (Hardened) ---
+                else if (command == "blpop" && parts.size() >= 3) {
+                    std::string key = parts[1];
+                    double timeout = std::stod(parts[2]);
+                    std::unique_lock<std::mutex> lock(kv_mutex);
+                    auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
+
+                    bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) 
+                                               : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
+                    if (ready) {
+                        std::string val = kv_store[key].list_val[0];
+                        kv_store[key].list_val.erase(kv_store[key].list_val.begin());
+                        response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                    } else response = "*-1\r\n";
+                    
+                    lock.unlock(); // Critical to unlock before sending
+                    send(client_fd, response.c_str(), response.length(), 0);
+                    response = ""; // Prevent double sending below
                 }
-                else if (command == "get" && parts.size() >= 2) {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (kv_store.count(parts[1])) {
-                        Node &n = kv_store[parts[1]];
-                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) {
-                            kv_store.erase(parts[1]);
-                            response = "$-1\r\n";
-                        } else response = to_bulk_string(n.string_val);
-                    } else response = "$-1\r\n";
-                }
-                // --- PING / ECHO ---
-                else if (command == "ping") response = "+PONG\r\n";
-                else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
-                // --- LIST COMMANDS ---
+                // --- RPUSH / LPUSH ---
                 else if (command == "rpush" || command == "lpush") {
                     {
                         std::lock_guard<std::mutex> lock(kv_mutex);
@@ -138,8 +130,31 @@ void handle_client(int client_fd) {
                     }
                     cv.notify_all();
                 }
+                // --- SET / GET ---
+                else if (command == "set" && parts.size() >= 3) {
+                    Node n; n.type = T_STRING; n.string_val = parts[2];
+                    if (parts.size() >= 5 && to_lowercase(parts[3]) == "px") {
+                        n.expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::stoll(parts[4]));
+                        n.has_expiry = true;
+                    }
+                    { std::lock_guard<std::mutex> lock(kv_mutex); kv_store[parts[1]] = n; }
+                    response = "+OK\r\n";
+                }
+                else if (command == "get" && parts.size() >= 2) {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    if (kv_store.count(parts[1])) {
+                        Node &n = kv_store[parts[1]];
+                        if (n.has_expiry && std::chrono::steady_clock::now() >= n.expiry) {
+                            kv_store.erase(parts[1]); response = "$-1\r\n";
+                        } else response = to_bulk_string(n.string_val);
+                    } else response = "$-1\r\n";
+                }
+                // --- OTHER ---
+                else if (command == "ping") response = "+PONG\r\n";
+                else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
 
                 if (!response.empty()) send(client_fd, response.c_str(), response.length(), 0);
+
             } catch (...) { break; }
         }
     }
