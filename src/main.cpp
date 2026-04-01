@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <map>
+#include <deque>
 
 enum DataType { T_STRING, T_LIST, T_STREAM };
 
@@ -23,7 +24,7 @@ struct StreamEntry {
 struct Node {
     DataType type = T_STRING;
     std::string string_val;
-    std::vector<std::string> list_val;
+    std::deque<std::string> list_val; // Using deque for O(1) pop_front
     std::vector<StreamEntry> stream_val;
     std::chrono::steady_clock::time_point expiry;
     bool has_expiry = false;
@@ -97,7 +98,31 @@ void handle_client(int client_fd) {
                         else response = "+string\r\n";
                     }
                 }
-                // --- BLPOP (Hardened) ---
+                // --- LPOP (Fix for Stage #JP1) ---
+                else if (command == "lpop" && parts.size() >= 2) {
+                    std::string key = parts[1];
+                    int count = (parts.size() >= 3) ? std::stoi(parts[2]) : 1;
+                    
+                    std::lock_guard<std::mutex> lock(kv_mutex);
+                    if (!kv_store.count(key) || kv_store[key].list_val.empty()) {
+                        response = "$-1\r\n";
+                    } else {
+                        auto &list = kv_store[key].list_val;
+                        int to_remove = std::min((int)list.size(), count);
+                        
+                        if (parts.size() >= 3) { // Array response for multi-pop
+                            response = "*" + std::to_string(to_remove) + "\r\n";
+                            for (int i = 0; i < to_remove; ++i) {
+                                response += to_bulk_string(list.front());
+                                list.pop_front();
+                            }
+                        } else { // Single Bulk String response
+                            response = to_bulk_string(list.front());
+                            list.pop_front();
+                        }
+                    }
+                }
+                // --- BLPOP ---
                 else if (command == "blpop" && parts.size() >= 3) {
                     std::string key = parts[1];
                     double timeout = std::stod(parts[2]);
@@ -107,14 +132,14 @@ void handle_client(int client_fd) {
                     bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) 
                                                : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
                     if (ready) {
-                        std::string val = kv_store[key].list_val[0];
-                        kv_store[key].list_val.erase(kv_store[key].list_val.begin());
+                        std::string val = kv_store[key].list_val.front();
+                        kv_store[key].list_val.pop_front();
                         response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
                     } else response = "*-1\r\n";
                     
-                    lock.unlock(); // Critical to unlock before sending
+                    lock.unlock();
                     send(client_fd, response.c_str(), response.length(), 0);
-                    response = ""; // Prevent double sending below
+                    response = ""; 
                 }
                 // --- RPUSH / LPUSH ---
                 else if (command == "rpush" || command == "lpush") {
@@ -124,7 +149,7 @@ void handle_client(int client_fd) {
                         n.type = T_LIST;
                         for (size_t i = 2; i < parts.size(); ++i) {
                             if (command == "rpush") n.list_val.push_back(parts[i]);
-                            else n.list_val.insert(n.list_val.begin(), parts[i]);
+                            else n.list_val.push_front(parts[i]);
                         }
                         response = ":" + std::to_string(n.list_val.size()) + "\r\n";
                     }
@@ -149,9 +174,12 @@ void handle_client(int client_fd) {
                         } else response = to_bulk_string(n.string_val);
                     } else response = "$-1\r\n";
                 }
-                // --- OTHER ---
                 else if (command == "ping") response = "+PONG\r\n";
                 else if (command == "echo" && parts.size() >= 2) response = to_bulk_string(parts[1]);
+                else {
+                    // Fallback for unknown commands to prevent tester timeout
+                    response = "-ERR unknown command '" + command + "'\r\n";
+                }
 
                 if (!response.empty()) send(client_fd, response.c_str(), response.length(), 0);
 
@@ -165,7 +193,7 @@ int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int reuse = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     struct sockaddr_in addr = {AF_INET, htons(6379), INADDR_ANY};
-    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return 1;
     listen(server_fd, 5);
     while (true) {
         int cf = accept(server_fd, NULL, NULL);
