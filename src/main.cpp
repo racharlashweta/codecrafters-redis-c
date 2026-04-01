@@ -18,8 +18,6 @@ struct Node {
     DataType type = T_STRING;
     std::string string_val;
     std::vector<std::string> list_val;
-    std::chrono::steady_clock::time_point expiry;
-    bool has_expiry = false;
 };
 
 std::unordered_map<std::string, Node> kv_store;
@@ -36,42 +34,48 @@ std::string to_bulk_string(const std::string& s) {
 }
 
 void handle_client(int client_fd) {
-    char buffer[1024];
+    char buffer[4096]; // Increased buffer for larger LRANGE/RPUSH
     while (true) {
         memset(buffer, 0, sizeof(buffer));
         ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer), 0);
         if (bytes_received <= 0) break;
 
         std::string input(buffer, bytes_received);
-        if (input[0] == '*') {
+        size_t offset = 0;
+
+        // Redis protocol can send multiple commands in one packet
+        while (offset < input.size() && input[offset] == '*') {
             std::vector<std::string> parts;
-            size_t pos = 0;
-            std::string temp = input;
-            while ((pos = temp.find("\r\n")) != std::string::npos) {
-                std::string line = temp.substr(0, pos);
-                if (line[0] != '*' && line[0] != '$') parts.push_back(line);
-                temp.erase(0, pos + 2);
+            size_t pos = input.find("\r\n", offset);
+            int num_elements = std::stoi(input.substr(offset + 1, pos - offset - 1));
+            offset = pos + 2;
+
+            for (int i = 0; i < num_elements; ++i) {
+                pos = input.find("\r\n", offset);
+                int len = std::stoi(input.substr(offset + 1, pos - offset - 1));
+                offset = pos + 2;
+                parts.push_back(input.substr(offset, len));
+                offset += len + 2;
             }
 
             if (parts.empty()) continue;
             std::string command = to_lowercase(parts[0]);
-            std::string response;
+            std::string response = "";
 
-            // --- TYPE ---
-            if (command == "type" && parts.size() >= 2) {
-                {
-                    std::lock_guard<std::mutex> lock(kv_mutex);
-                    if (!kv_store.count(parts[1])) {
-                        response = "+none\r\n";
-                    } else {
-                        Node &n = kv_store[parts[1]];
-                        if (n.type == T_STRING) response = "+string\r\n";
-                        else if (n.type == T_LIST) response = "+list\r\n";
-                    }
-                }
+            if (command == "ping") {
+                response = "+PONG\r\n";
+            } 
+            else if (command == "type" && parts.size() >= 2) {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                if (kv_store.find(parts[1]) == kv_store.end()) response = "+none\r\n";
+                else response = (kv_store[parts[1]].type == T_LIST) ? "+list\r\n" : "+string\r\n";
             }
-            // --- RPUSH / LPUSH ---
-            else if ((command == "rpush" || command == "lpush") && parts.size() >= 3) {
+            else if (command == "set" && parts.size() >= 3) {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                kv_store[parts[1]] = {T_STRING, parts[2]};
+                response = "+OK\r\n";
+            }
+            else if (command == "rpush" || command == "lpush") {
                 {
                     std::lock_guard<std::mutex> lock(kv_mutex);
                     Node &n = kv_store[parts[1]];
@@ -82,37 +86,17 @@ void handle_client(int client_fd) {
                     }
                     response = ":" + std::to_string(n.list_val.size()) + "\r\n";
                 }
-                cv.notify_all(); 
+                cv.notify_all();
             }
-            // --- BLPOP ---
-            else if (command == "blpop" && parts.size() >= 3) {
-                std::string key = parts[1];
-                double timeout = std::stod(parts[2]);
-                std::unique_lock<std::mutex> lock(kv_mutex);
-                auto pred = [&key] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
-
-                bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) 
-                                           : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
-
-                if (ready) {
-                    std::string val = kv_store[key].list_val[0];
-                    kv_store[key].list_val.erase(kv_store[key].list_val.begin());
-                    response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
-                } else {
-                    response = "*-1\r\n";
-                }
-                lock.unlock(); // Explicitly unlock before send
-            }
-            // --- LPOP ---
             else if (command == "lpop" && parts.size() >= 2) {
                 std::lock_guard<std::mutex> lock(kv_mutex);
-                if (!kv_store.count(parts[1]) || kv_store[parts[1]].list_val.empty()) {
+                if (kv_store.find(parts[1]) == kv_store.end() || kv_store[parts[1]].list_val.empty()) {
                     response = "$-1\r\n";
                 } else {
                     auto &list = kv_store[parts[1]].list_val;
                     if (parts.size() == 2) {
-                        std::string val = list[0]; list.erase(list.begin());
-                        response = to_bulk_string(val);
+                        response = to_bulk_string(list[0]);
+                        list.erase(list.begin());
                     } else {
                         int count = std::stoi(parts[2]);
                         int to_pop = std::min(count, (int)list.size());
@@ -124,7 +108,23 @@ void handle_client(int client_fd) {
                     }
                 }
             }
-            // --- LRANGE ---
+            else if (command == "blpop" && parts.size() >= 3) {
+                std::string key = parts[1];
+                double timeout = std::stod(parts[2]);
+                std::unique_lock<std::mutex> lock(kv_mutex);
+                auto pred = [&] { return kv_store.count(key) && !kv_store[key].list_val.empty(); };
+
+                bool ready = (timeout == 0) ? (cv.wait(lock, pred), true) 
+                                           : cv.wait_for(lock, std::chrono::duration<double>(timeout), pred);
+                if (ready) {
+                    std::string val = kv_store[key].list_val[0];
+                    kv_store[key].list_val.erase(kv_store[key].list_val.begin());
+                    response = "*2\r\n" + to_bulk_string(key) + to_bulk_string(val);
+                } else {
+                    response = "*-1\r\n";
+                }
+                lock.unlock();
+            }
             else if (command == "lrange" && parts.size() >= 4) {
                 std::lock_guard<std::mutex> lock(kv_mutex);
                 if (kv_store.count(parts[1]) && kv_store[parts[1]].type == T_LIST) {
@@ -134,28 +134,14 @@ void handle_client(int client_fd) {
                     if (start < 0) start = n + start;
                     if (stop < 0) stop = n + stop;
                     start = std::max(0, start); stop = std::min(n - 1, stop);
-                    if (start >= n || start > stop) {
-                        response = "*0\r\n";
-                    } else {
+                    if (start >= n || start > stop) response = "*0\r\n";
+                    else {
                         response = "*" + std::to_string(stop - start + 1) + "\r\n";
                         for (int i = start; i <= stop; ++i) response += to_bulk_string(list[i]);
                     }
                 } else {
                     response = "*0\r\n";
                 }
-            }
-            // --- SET / GET / PING ---
-            else if (command == "set" && parts.size() >= 3) {
-                std::lock_guard<std::mutex> lock(kv_mutex);
-                kv_store[parts[1]] = {T_STRING, parts[2]};
-                response = "+OK\r\n";
-            }
-            else if (command == "get" && parts.size() >= 2) {
-                std::lock_guard<std::mutex> lock(kv_mutex);
-                response = (kv_store.count(parts[1])) ? to_bulk_string(kv_store[parts[1]].string_val) : "$-1\r\n";
-            }
-            else if (command == "ping") {
-                response = "+PONG\r\n";
             }
 
             if (!response.empty()) {
