@@ -13,63 +13,57 @@ struct StreamEntry {
     std::vector<std::string> fields;
 };
 
-// Storage for streams
+// Global storage for streams
 std::map<std::string, std::vector<StreamEntry>> streams;
 
-// Helper: Formats a string into RESP Bulk String format
+// --- HELPERS ---
+
 std::string to_bulk(const std::string& s) {
     return "$" + std::to_string(s.length()) + "\r\n" + s + "\r\n";
 }
 
-// Helper: Parses ID "100-1" into {100, 1} for comparison
 std::pair<long long, long long> parse_id(const std::string& id_str, bool is_start) {
     size_t dash = id_str.find('-');
     if (dash == std::string::npos) {
         long long ms = std::stoll(id_str);
-        // If no sequence: start defaults to 0, end defaults to max
         return {ms, is_start ? 0 : 9223372036854775807LL};
     }
     return {std::stoll(id_str.substr(0, dash)), std::stoll(id_str.substr(dash + 1))};
 }
 
-// --- COMMAND HANDLERS ---
+// --- COMMANDS ---
 
 std::string handle_xadd(const std::vector<std::string>& args) {
     if (args.size() < 3) return "-ERR missing args\r\n";
     std::string key = args[0];
     std::string id = args[1];
     std::vector<std::string> fields(args.begin() + 2, args.end());
-
     streams[key].push_back({id, fields});
-    return to_bulk(id); // Crucial: XADD must return the ID
+    return to_bulk(id);
 }
 
 std::string handle_xrange(const std::vector<std::string>& args) {
-    if (args.size() < 3) return "-ERR missing args\r\n";
     std::string key = args[0];
-    if (streams.find(key) == streams.end()) return "*0\r\n";
+    auto start_lim = parse_id(args[1], true);
+    auto end_lim = parse_id(args[2], false);
 
-    auto start_limit = parse_id(args[1], true);
-    auto end_limit = parse_id(args[2], false);
-
-    std::string res = "";
-    int count = 0;
-
+    std::vector<const StreamEntry*> matches;
     for (const auto& entry : streams[key]) {
         auto curr = parse_id(entry.id, true);
-        if (curr >= start_limit && curr <= end_limit) {
-            count++;
-            // Each entry is an array of 2: [ID, [fields]]
-            res += "*2\r\n";
-            res += to_bulk(entry.id);
-            res += "*" + std::to_string(entry.fields.size()) + "\r\n";
-            for (const auto& f : entry.fields) res += to_bulk(f);
-        }
+        if (curr >= start_lim && curr <= end_lim) matches.push_back(&entry);
     }
-    return "*" + std::to_string(count) + "\r\n" + res;
+
+    std::string res = "*" + std::to_string(matches.size()) + "\r\n";
+    for (auto m : matches) {
+        res += "*2\r\n"; // Entry Wrapper
+        res += to_bulk(m->id);
+        res += "*" + std::to_string(m->fields.size()) + "\r\n"; // Fields Array
+        for (const auto& f : m->fields) res += to_bulk(f);
+    }
+    return res;
 }
 
-// --- SERVER BOILERPLATE ---
+// --- CORE SERVER ---
 
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -82,23 +76,31 @@ int main() {
 
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
-        char buffer[2048] = {0};
-        int bytes_received = read(client_fd, buffer, 2048);
         
-        if (bytes_received > 0) {
-            // NOTE: You must implement a proper RESP parser here to extract 
-            // the command and arguments into a std::vector<std::string> cmd_parts.
-            // For now, let's assume cmd_parts is populated.
+        // INNER LOOP: Key for persistent connections
+        while (true) {
+            char buffer[4096] = {0};
+            int bytes = recv(client_fd, buffer, sizeof(buffer), 0);
+            if (bytes <= 0) break; 
 
-            std::vector<std::string> cmd_parts = {"XADD", "banana", "0-1", "orange", "raspberry"}; // Mock example
-            
-            std::string cmd = cmd_parts[0];
+            // Simple RESP parser (Splits by \r\n and skips RESP metadata symbols)
+            std::vector<std::string> parts;
+            char* line = strtok(buffer, "\r\n");
+            while (line != NULL) {
+                if (line[0] != '*' && line[0] != '$') parts.push_back(line);
+                line = strtok(NULL, "\r\n");
+            }
+
+            if (parts.empty()) continue;
+
+            std::string cmd = parts[0];
             std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::toupper);
-            std::vector<std::string> args(cmd_parts.begin() + 1, cmd_parts.end());
+            std::vector<std::string> args(parts.begin() + 1, parts.end());
 
             std::string response;
             if (cmd == "XADD") response = handle_xadd(args);
             else if (cmd == "XRANGE") response = handle_xrange(args);
+            else if (cmd == "PING") response = "+PONG\r\n";
             else response = "+OK\r\n";
 
             send(client_fd, response.c_str(), response.length(), 0);
