@@ -1,33 +1,33 @@
-[![progress-banner](https://backend.codecrafters.io/progress/redis/08eda9f1-3f06-4521-afe2-4e14a516cc7d)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# Redis-Lite: Custom Distributed Key-Value Store
 
-This is a starting point for C++ solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+A high-performance, multi-threaded Redis clone built from scratch in C. This project implements core Redis functionality, including advanced data structures, master-slave replication, and cryptographic data integrity.
 
-In this challenge, you'll build a toy Redis clone that's capable of handling
-basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about
-event loops, the Redis protocol and more.
+## 🛠 Technical Highlights
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+### 1. Advanced Data Structures
+* **Skip Lists:** Powering `Sorted Sets` (ZSET). Implemented with a probabilistic balancing strategy to ensure $O(\log n)$ search and insertion without the overhead of tree rebalancing.
+* **Geospatial Indexing:** Uses **Morton Coding (Bit Interleaving)** to map 2D coordinates into a 1D searchable space, enabling efficient location-based queries.
+* **Custom Hash Map:** Optimized key-value storage using the `djb2` algorithm with separate chaining for collision resolution.
 
-# Passing the first stage
+### 2. Distributed Systems & Replication
+* **Master-Slave Handshake:** Full implementation of the Redis replication protocol, supporting `PING`, `REPLCONF`, and `PSYNC` for state synchronization.
+* **Atomic Transactions:** Supports `MULTI`, `EXEC`, and `DISCARD` commands via a thread-safe command-queueing mechanism.
+* **RDB Persistence:** Custom binary parser for `.rdb` files, allowing the server to restore state and handle sub-second TTL (Time-To-Live) logic.
 
-The entry point for your Redis implementation is in `src/main.cpp`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+### 3. Security & Performance
+* **SHA-256 Integrity:** Integrated cryptographic hashing to ensure data consistency and secure identifier generation.
+* **Concurrency:** Multi-threaded architecture using `pthreads` and `poll()` to handle multiple concurrent client connections and replication ACKs.
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
+---
 
-That's all!
+## 🚀 Getting Started
 
-# Stage 2 & beyond
+### Prerequisites
+* Linux environment (Tested on Ubuntu 24.04 LTS)
+* GCC Compiler
 
-Note: This section is for stages 2 and beyond.
+### Compilation
+Use the following command to compile with optimizations and necessary libraries:
 
-1. Ensure you have `cmake` installed locally
-1. Run `./your_program.sh` to run your Redis server, which is implemented in
-   `src/main.cpp`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+```bash
+gcc -Wall -Wextra -O2 -o redis-lite main.c sha256.c -lpthread -lm
