@@ -7,13 +7,14 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
+#include <chrono>
 
 struct StreamEntry {
     std::string id;
     std::vector<std::string> fields;
 };
 
-// Global storage for streams
+// Storage
 std::map<std::string, std::vector<StreamEntry>> streams;
 
 // --- HELPERS ---
@@ -31,19 +32,51 @@ std::pair<long long, long long> parse_id(const std::string& id_str, bool is_star
     return {std::stoll(id_str.substr(0, dash)), std::stoll(id_str.substr(dash + 1))};
 }
 
+long long get_current_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 // --- COMMANDS ---
 
 std::string handle_xadd(const std::vector<std::string>& args) {
     if (args.size() < 3) return "-ERR missing args\r\n";
     std::string key = args[0];
-    std::string id = args[1];
+    std::string id_input = args[1];
+    std::string final_id;
+
+    if (id_input == "*") {
+        long long now_ms = get_current_ms();
+        long long seq = 0;
+
+        if (!streams[key].empty()) {
+            auto last = parse_id(streams[key].back().id, true);
+            if (now_ms == last.first) {
+                seq = last.second + 1;
+            } else if (now_ms < last.first) {
+                // Ensure time doesn't go backwards (safety for Redis spec)
+                now_ms = last.first;
+                seq = last.second + 1;
+            }
+        } else if (now_ms == 0) {
+            seq = 1; // 0-0 is forbidden
+        }
+        final_id = std::to_string(now_ms) + "-" + std::to_string(seq);
+    } else {
+        final_id = id_input;
+    }
+
     std::vector<std::string> fields(args.begin() + 2, args.end());
-    streams[key].push_back({id, fields});
-    return to_bulk(id);
+    streams[key].push_back({final_id, fields});
+    return to_bulk(final_id);
 }
 
 std::string handle_xrange(const std::vector<std::string>& args) {
+    if (args.size() < 3) return "-ERR missing args\r\n";
     std::string key = args[0];
+    if (streams.find(key) == streams.end()) return "*0\r\n";
+
     auto start_lim = parse_id(args[1], true);
     auto end_lim = parse_id(args[2], false);
 
@@ -55,15 +88,14 @@ std::string handle_xrange(const std::vector<std::string>& args) {
 
     std::string res = "*" + std::to_string(matches.size()) + "\r\n";
     for (auto m : matches) {
-        res += "*2\r\n"; // Entry Wrapper
-        res += to_bulk(m->id);
-        res += "*" + std::to_string(m->fields.size()) + "\r\n"; // Fields Array
+        res += "*2\r\n" + to_bulk(m->id);
+        res += "*" + std::to_string(m->fields.size()) + "\r\n";
         for (const auto& f : m->fields) res += to_bulk(f);
     }
     return res;
 }
 
-// --- CORE SERVER ---
+// --- SERVER ---
 
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -76,14 +108,11 @@ int main() {
 
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
-        
-        // INNER LOOP: Key for persistent connections
         while (true) {
             char buffer[4096] = {0};
             int bytes = recv(client_fd, buffer, sizeof(buffer), 0);
-            if (bytes <= 0) break; 
+            if (bytes <= 0) break;
 
-            // Simple RESP parser (Splits by \r\n and skips RESP metadata symbols)
             std::vector<std::string> parts;
             char* line = strtok(buffer, "\r\n");
             while (line != NULL) {
@@ -92,7 +121,6 @@ int main() {
             }
 
             if (parts.empty()) continue;
-
             std::string cmd = parts[0];
             std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::toupper);
             std::vector<std::string> args(parts.begin() + 1, parts.end());
