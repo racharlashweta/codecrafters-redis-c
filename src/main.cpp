@@ -14,7 +14,6 @@ struct StreamEntry {
     std::vector<std::string> fields;
 };
 
-// Storage for streams
 std::map<std::string, std::vector<StreamEntry>> streams;
 
 // --- HELPERS ---
@@ -27,37 +26,36 @@ std::string to_bulk(const std::string& s) {
 std::pair<long long, long long> parse_id(const std::string& id_str, bool is_start) {
     size_t dash = id_str.find('-');
     if (dash == std::string::npos) {
-        long long ms = std::stoll(id_str);
-        // Start defaults to seq 0, End defaults to max seq
-        return {ms, is_start ? 0 : 9223372036854775807LL};
+        try {
+            long long ms = std::stoll(id_str);
+            return {ms, is_start ? 0 : 9223372036854775807LL};
+        } catch (...) { return {0, 0}; }
     }
     return {std::stoll(id_str.substr(0, dash)), std::stoll(id_str.substr(dash + 1))};
 }
 
-// --- COMMANDS ---
+// --- XADD LOGIC ---
 
 std::string handle_xadd(const std::vector<std::string>& args) {
-    if (args.size() < 3) return "-ERR missing args\r\n";
+    if (args.size() < 2) return "-ERR missing args\r\n";
     
     std::string key = args[0];
     std::string id_input = args[1];
     std::string final_id;
 
     if (id_input == "*") {
-        // Generate ID using current milliseconds
         long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         
         long long seq = 0;
         if (!streams[key].empty()) {
             auto last = parse_id(streams[key].back().id, true);
-            // If we are in the same millisecond as the last entry, increment sequence
             if (now_ms <= last.first) {
                 now_ms = last.first;
                 seq = last.second + 1;
             }
         } else if (now_ms == 0) {
-            seq = 1; // 0-0 is invalid in Redis
+            seq = 1;
         }
         final_id = std::to_string(now_ms) + "-" + std::to_string(seq);
     } else {
@@ -65,38 +63,39 @@ std::string handle_xadd(const std::vector<std::string>& args) {
     }
 
     // Key-value pairs start at args[2]
-    std::vector<std::string> fields(args.begin() + 2, args.end());
-    streams[key].push_back({final_id, fields});
+    std::vector<std::string> fields;
+    for (size_t i = 2; i < args.size(); ++i) {
+        fields.push_back(args[i]);
+    }
     
-    // Return the ID that was actually used (the generated one or the input one)
+    streams[key].push_back({final_id, fields});
     return to_bulk(final_id);
 }
 
-std::string handle_xrange(const std::vector<std::string>& args) {
-    if (args.size() < 3) return "-ERR missing args\r\n";
-    std::string key = args[0];
-    if (streams.find(key) == std::end(streams)) return "*0\r\n";
+// --- XRANGE LOGIC ---
 
+std::string handle_xrange(const std::vector<std::string>& args) {
+    std::string key = args[0];
     auto start_lim = parse_id(args[1], true);
     auto end_lim = parse_id(args[2], false);
 
-    std::string entries_resp = "";
-    int match_count = 0;
-
-    for (const auto& entry : streams[key]) {
-        auto curr = parse_id(entry.id, true);
-        if (curr >= start_lim && curr <= end_lim) {
-            match_count++;
-            entries_resp += "*2\r\n";
-            entries_resp += to_bulk(entry.id);
-            entries_resp += "*" + std::to_string(entry.fields.size()) + "\r\n";
-            for (const auto& f : entry.fields) entries_resp += to_bulk(f);
+    std::string res = "";
+    int count = 0;
+    if (streams.count(key)) {
+        for (const auto& entry : streams[key]) {
+            auto curr = parse_id(entry.id, true);
+            if (curr >= start_lim && curr <= end_lim) {
+                count++;
+                res += "*2\r\n" + to_bulk(entry.id);
+                res += "*" + std::to_string(entry.fields.size()) + "\r\n";
+                for (const auto& f : entry.fields) res += to_bulk(f);
+            }
         }
     }
-    return "*" + std::to_string(match_count) + "\r\n" + entries_resp;
+    return "*" + std::to_string(count) + "\r\n" + res;
 }
 
-// --- SERVER ---
+// --- SERVER MAIN ---
 
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -109,20 +108,29 @@ int main() {
 
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
-        
         while (true) {
-            char buffer[4096] = {0};
+            char buffer[8192] = {0};
             int bytes = recv(client_fd, buffer, sizeof(buffer), 0);
             if (bytes <= 0) break;
 
-            // Simplified RESP parser: ignores $, *, and lengths to get raw strings
+            // REPRODUCIBLE PARSER
+            // This logic strictly extracts only the string values between RESP markers
             std::vector<std::string> parts;
-            char* line = strtok(buffer, "\r\n");
-            while (line != NULL) {
-                if (line[0] != '*' && line[0] != '$') {
-                    parts.push_back(line);
+            std::string temp = "";
+            bool reading = false;
+            for(int i=0; i < bytes; ++i) {
+                if (buffer[i] == '\r' || buffer[i] == '\n') {
+                    if (reading && !temp.empty()) {
+                        // Ignore lines that are just numbers (RESP lengths)
+                        if (temp[0] != '*' && temp[0] != '$') {
+                            parts.push_back(temp);
+                        }
+                    }
+                    temp = "";
+                    reading = true;
+                } else {
+                    temp += buffer[i];
                 }
-                line = strtok(NULL, "\r\n");
             }
 
             if (parts.empty()) continue;
@@ -134,6 +142,7 @@ int main() {
             std::string response;
             if (cmd == "XADD") response = handle_xadd(args);
             else if (cmd == "XRANGE") response = handle_xrange(args);
+            else if (cmd == "PING") response = "+PONG\r\n";
             else response = "+OK\r\n";
 
             send(client_fd, response.c_str(), response.length(), 0);
